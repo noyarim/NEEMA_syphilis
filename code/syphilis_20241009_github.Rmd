@@ -1,0 +1,1254 @@
+---
+title: "R model for syphilis QALY loss estimation"
+author: "Kyu Lee"
+last updated: "10/09/2024"
+output: pdf_document
+---
+
+
+0. Load packages. If not installed, install the following packages using install.packages() command.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("readxl")
+library("dplyr")
+library("ggplot2")
+library("openxlsx")
+library("reshape2")
+library("gridExtra")
+library("DirichletReg")
+library("ggpubr")
+
+```
+
+1. Set directories to import the data from and to save outputs
+```{r}
+# directory to import data from
+mydir <- "/Users/kyueunlee/Library/CloudStorage/GoogleDrive-leex5499@umn.edu/My Drive/Z Drive/Project_all/2020/CDC_STD/Github/data/"
+# directory to save outputs
+myoutdir <- "/Users/kyueunlee/Library/CloudStorage/GoogleDrive-leex5499@umn.edu/My Drive/Z Drive/Project_all/2020/CDC_STD/Github/output/"
+```
+
+2. Functions 
+2-1. import_data: this function is to import subgroup-specific model parameters from "data_import_syphilis_clean.xlsx".
+```{r}
+import_data <- function(male, msm, preg){
+  age_disutil = as.data.frame(read_excel(paste0(mydir, "data_import_syphilis_clean.xlsx"), sheet='age_disutility'))
+  if (male == 1 & msm == 1){ # MSM
+      param <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet= 'MSM'))
+      pDie <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'lifetable_m'))
+      pDie$month_mortality = 1-exp(log(1-pDie$mortality/12)) # change to monthly prob
+      pDie_TS = as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'excessmortality_TS'))
+  } else{
+    if(male == 1 & msm == 0){ #MSW
+      param <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'MSW'))
+      pDie <- as.data.frame(read_excel(paste0(mydir, "data_import_syphilis_clean.xlsx"), sheet = 'lifetable_m'))
+      pDie$month_mortality <- 1-exp(log(1-pDie$mortality/12)) # change to monthly prob
+      pDie_TS <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'excessmortality_TS'))
+    } else{
+      if(preg == 0){ # non-pregnant women
+        param <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'preg_women'))
+        pDie <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'lifetable_f'))
+        pDie$month_mortality <- 1-exp(log(1-pDie$mortality/12)) # change to monthly prob
+        pDie_TS <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'excessmortality_TS'))
+        pTestTreat_dt <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'pTestTreat_women'))
+      }else{ #pregnant women
+        param <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'preg_women'))
+        pDie <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet = 'lifetable_f'))
+        pDie$month_mortality <- 1-exp(log(1-pDie$mortality/12)) # change to monthly prob
+        pDie_TS <- as.data.frame(read_excel(paste0(mydir,"data_import_syphilis_clean.xlsx"), sheet <- 'excessmortality_TS'))
+    }
+    }
+  }
+  if (male == 0 & preg == 0){
+    return(list(param,pDie,pDie_TS,age_disutil,pTestTreat_dt))
+  }else {
+    return(list(param, pDie, pDie_TS, age_disutil))
+  }
+}
+
+```
+
+2-2.update_pTrans: this function is to generate an age-specific transition matrix to run markov cohort model
+```{r}
+update_pTrans<- function(param, pDie, pDie_TS, pTrans, age){
+    # param: subgroup-specific parameters
+    # pDie: mortality due to all other causes
+    # pDie: mortality due to teriary syphilis
+    # pTrans: transition probability matrix (to be updated)
+    # age: age in this cycle
+  
+    # find age-specific baseline and disease-specific mortality
+    age <- floor(age) 
+    list_state <- seq(1,n_state)
+    pDie_base <- pDie$month_mortality[age+1]
+    hr_age_bin <- findInterval(age, pDie_TS$age) # age bin to find hazard ratio of tertiary syphilis
+    HR_TS <- pDie_TS$rateratio[hr_age_bin]
+    pDie_tertiary <- 1-exp(log(1-pDie_base)*HR_TS)
+    
+    # other parameters
+    Dur_PS <- param$Dur_PS
+    Dur_SS <- param$Dur_SS
+    Dur_EL <- param$Dur_EL
+    pPS2Treat <- param$pSeekTx_PS * param$pTxSuccess_early
+    pPS2EN <- param$pNeuro * param$pNS_early
+    pSS2Treat <- param$pSeekTx_SS * param$pTxSuccess_early
+    pSS2EN <- param$pNeuro * param$pNS_early
+    pEL2Treat <- param$pSeekTx_EL * param$pTxSuccess_early
+    pEL2EN <- param$pNeuro* param$pNS_early
+    TTTS <- param$TTTS 
+    TTLN <- param$TTLN
+    pTxSx_late <- param$pTxSuccess_late
+    pLL2Treat <- param$pSeekTx_LL * pTxSx_late
+    pTS2Treat <- param$pTS2Treat
+    pEN2TS <- param$pEN2TS
+    pEN2Treat <- param$pEN2Treat
+    # calculate progression based on duration in the state
+    pPS2SS <- param$pPS2SS <- 1-exp(-(1/Dur_PS))
+    pSS2EL <- param$pSS2EL <- 1-exp(-(1/Dur_SS))
+    pEL2LL <- param$pEL2LL <- 1-exp(-(1/Dur_EL))
+    pLL2TS <- param$pLL2TS <- pEN2TS # probability of developing tertiary syphilis #1-exp(-(1/(TTTS - Dur_PS - Dur_SS - Dur_EL)))
+    pLL2LN <- param$pLL2LN <- param$pNeuro* param$pNS_late #1-exp(-(1/(TTLN - Dur_PS - Dur_SS - Dur_EL)))
+    
+    # Transition probability for Primary Syphilis (PS)
+    pTrans[PS, SS] <- (1-pDie_base)*pPS2SS
+    pTrans[PS, Treated] <- (1-pDie_base)*pPS2Treat * 0.5
+    pTrans[PS, EN] <- (1-pDie_base)*pPS2EN
+    pTrans[PS, Dead_other] <- pDie_base
+    pTrans[PS, PS] <- 1-sum(pTrans[PS,c(list_state[1:PS-1],list_state[(PS+1):n_state])]) 
+    # Transition probability for Secondary Syphilis (SS)
+    pTrans[SS, EL] <- (1-pDie_base)*pSS2EL
+    pTrans[SS, Treated] <- (1-pDie_base)*pSS2Treat * 0.5
+    pTrans[SS, EN] <- (1-pDie_base)*pSS2EN
+    pTrans[SS, Dead_other] <- pDie_base
+    pTrans[SS, SS] <- 1-sum(pTrans[SS,c(list_state[1:SS-1],list_state[(SS+1):n_state])]) 
+    # Transition probability for Early Latent (EL)
+    pTrans[EL, LL] <- (1-pDie_base)*pEL2LL
+    pTrans[EL, Treated] <- (1-pDie_base)*pEL2Treat * 0.5
+    pTrans[EL, EN] <- (1-pDie_base)*pEL2EN
+    pTrans[EL, Dead_other] <- pDie_base
+    pTrans[EL, EL] <- 1-sum(pTrans[EL,c(list_state[1:EL-1],list_state[(EL+1):n_state])])    
+    # Transition probability for Late Latent (LL)
+    pTrans[LL, TS_notx] <- (1-pDie_base)*pLL2TS
+    pTrans[LL, Treated] <- (1-pDie_base)*pLL2Treat
+    pTrans[LL, LN] <- (1-pDie_base)*pLL2LN  
+    pTrans[LL, Dead_other] <- pDie_base
+    pTrans[LL, LL] <- 1-sum(pTrans[LL,c(list_state[1:LL-1],list_state[(LL+1):n_state])])  
+    # Transition probability for untreated Tertiary syphiilis (TS)
+    pTrans[TS_notx, TS] <- (1-pDie_tertiary) * pTxSx_late
+    pTrans[TS_notx, Dead_TS] <- pDie_tertiary - pDie_base
+    pTrans[TS_notx, Dead_other] <- pDie_base
+    pTrans[TS_notx, TS_notx] <- 1-sum(pTrans[TS_notx,c(list_state[1:TS_notx-1],list_state[(TS_notx+1):n_state])])   
+    # Transition probability for treated Tertiary syphilis (TS)
+    pTrans[TS, Dead_other] <- pDie_base
+    pTrans[TS, TS] <- 1-sum(pTrans[TS,c(list_state[1:TS-1],list_state[(TS+1):n_state])])     
+    # Transition probability for Early Neurosyphilis (EN)
+    pTrans[EN, TS_notx] <- (1-pDie_base)*pEN2TS
+    pTrans[EN, Treated] <- (1-pDie_base)*pEN2Treat
+    pTrans[EN, Dead_other] <- pDie_base
+    pTrans[EN, EN] <- 1-sum(pTrans[EN,c(list_state[1:EN-1],list_state[(EN+1):n_state])])  
+    # Transition proability for Late Neurosyphiilis (LN)
+    pTrans[LN, TS] <- (1-pDie_base)*pTxSx_late
+    pTrans[LN, Dead_other] <- pDie_base
+    pTrans[LN, LN] <- 1-sum(pTrans[LN,c(list_state[1:LN-1],list_state[(LN+1):n_state])])   
+    # Transition proability for Treatd  
+    pTrans[Treated, Dead_other] <- pDie_base
+    pTrans[Treated, Treated] <- 1-sum(pTrans[Treated,c(list_state[1:Treated-1],list_state[(Treated+1):n_state])])      
+    # Transition probability for Dead
+    pTrans[Dead_TS, Dead_TS] <- 1   
+    pTrans[Dead_other, Dead_other] <- 1
+    
+  
+    return(pTrans)    
+}
+```
+
+2-3. cal_LE: this function calculates (undiscounted/discounted) age-adjusted life expectancy with a Markov table. You can turn on and off the discounting using the 'discount' argument of the function.
+```{r}
+cal_LE <- function(Markov, discount, t_horizon){
+    # Markov: Markov trace matrix
+    # discount: 1 if discounting, 0 if not discounting outcomes
+    # t_horizon: total number of cycles
+    
+    # calculate the number of people alive
+    alive = 1- Markov[,Dead_TS] - Markov[,Dead_other]
+    # collapse LE over time horizon
+    if (discount == 0){ # if no discounting
+      LE <- sum(alive)/12}
+    else { # if discounting life expectancy
+      # discount factor
+      disc_fct <- rep(NA, t_horizon)
+      disc_fct[1] <- 1
+      for (t in 1:(t_horizon-1)){
+        disc_fct[t+1] <- disc_fct[t]/((1+0.03)^(1/12)) # monthly discounting
+      }
+      # discounted life expectancy
+      LE <- sum(alive * disc_fct)/12
+
+    }
+    
+    return(LE)}
+```
+
+2-4. cal_QALY: this function calculates (undiscounted/discounted) age-adjusted quality-adjusted life years. Set discounting using the 'discount' argument.
+```{r}
+cal_QALY <- function(Markov, data, discount, t_horizon){
+  # Markov: Markov trace matrix
+  # data: 
+  #       data[[1]] parameters 
+  #       data[[2]] age-specific baseline mortality
+  #       data[[3]] tertiary syphilis mortality
+  #       data[[4]] age-specific disutility
+  #       data[[5]] age-specific test and treat probability among women
+  # discount: 1 if discounting, 0 if not discounting the outcomes
+  # t_horizon: total number of cycles
+  
+  
+  # parameter and age-specific disutility from data
+  param <- data[[1]]
+  age_disutil <- data[[4]]
+  # utility of each state  
+  utility <- as.numeric(param[c('uPS','uSS','uEL','uLL','uTS_notx','uTS','uEN','uLN','uTreat','uDead_TS','uDead_other')])
+  # disutility of each state
+  disutility <- 1 - utility
+  # multiply Markov state matrix with utility values
+  Markov_u <- sweep(Markov, MARGIN=2, utility, '*') 
+  Markov_du <- sweep(Markov, MARGIN =2, disutility, '*')
+  # collapse QALY over time horizon
+  if (discount == 0){ # if no discounting
+    # Rowsum
+    QALY_rowsum <- rowSums(Markov_u)
+    QALY <- sum(QALY_rowsum)/12
+    QALY_du <- colSums(Markov_du) # ignore this
+  }else{
+    # discount factor
+    age_disutil_fct <- rep(NA, t_horizon)
+    disc_fct <- rep(NA, t_horizon)
+    disc_fct[1] <- 1
+    for (t in 1:(t_horizon-1)){
+      age_idx = findInterval(t/12, age_disutil$age)
+      disc_fct[t+1] <- disc_fct[t]/((1+0.03)^(1/12)) # monthly discounting
+      age_disutil_fct[t] = age_disutil$age_disutility[age_idx]
+    }
+    age_disutil_fct[t_horizon] = age_disutil_fct[t_horizon-1]
+    # discounted QALY
+    QALY_rowsum <- rowSums(Markov_u)
+    QALY <- sum(QALY_rowsum * disc_fct * age_disutil_fct)/12
+    # discounted disutility
+    QALY_du <- colSums(Markov_du * disc_fct * age_disutil_fct)/12
+    }
+    
+  return(list(QALY, QALY_du))}
+
+```
+
+2-5. cal_QALY_preg: this function calculates one-time maternal disutility of syphilis during pregnancy. This function folds tree for primary syphilis in pregnancy (see document: "STDQALY_ModelConfig_Syphilis.docx'). 
+```{r}
+cal_QALY_preg <- function(PS_QALY, TX_QALY, data, discount){
+  # PS_QALY: lifetime QALY estimate with primary syphilis
+  # TX_QALY: lifetime QALY estimate without syphilis (healthy)
+  # data: 
+  #       data[[1]] parameters 
+  #       data[[2]] age-specific baseline mortality
+  #       data[[3]] tertiary syphilis mortality
+  #       data[[4]] age-specific disutility
+  #       data[[5]] age-specific test and treat probability among women  
+  # discount: 1 if discounting, 0 if not discounting outcomes
+  
+  
+  # parameter 
+  param <- data[[1]]
+  # QALY of infant outcomes
+  CS <- param$pSympCS_others * (-param$duCS_mat) # QALY loss of primary syphilis if congenital syphilis occurs during pregnancy
+  LB <- param$pSympCS_LB * (-param$duLB_mat) # QALY loss of primary syphilis if low birth weight occurs during pregnancy
+  duSymp = CS + LB # QALY loss of symptomatic CS
+  if (discount == 0){
+    duMat = param$pSympCS*duSymp + param$pAsympCS*0 + param$pSB*(-param$duSB_mat)*7.2 # average QALY Loss of CS
+  } else{
+    duMat = param$pSympCS*duSymp + param$pAsympCS*0 + param$pSB*sum(rep(-param$duSB_mat,7)*c(1,0.97,0.94,0.92,0.89,0.86,0.84)) # average QALY Loss of CS
+  }
+
+  return(duMat)}
+```
+
+2-6. run_Markov: this function initiates Markov matrix and run Markov transition over time horizon
+```{r}
+run_Markov <- function(init_state, data, start_age, t_horizon, male, preg){
+  # init_state: initial distribution across health states
+  # data: 
+  #       data[[1]] parameters 
+  #       data[[2]] age-specific baseline mortality
+  #       data[[3]] tertiary syphilis mortality
+  #       data[[4]] age-specific disutility
+  #       data[[5]] age-specific test and treat probability among women
+  # start_age: age at the beginning of simulation
+  # t_horizon: total number of cycles
+  # male: 1 if male, 0 if female
+  # preg: 1 if pregnant women, 0 if non-pregnant women
+  
+  # Initialize Markov state matrix and intermediate outcomes
+  Markov <- matrix(INTEGER, ncol=n_state, nrow=t_horizon)
+  int_outcome <- data.frame(time=seq(1,t_horizon,by=1), perc_LN = rep(0,t_horizon), perc_TS = rep(0,t_horizon))
+  # at time = 1
+  Markov[1,] = init_state
+  # model parameters
+  param <- data[[1]]
+  pDie <- data[[2]]
+  pDie_TS <- data[[3]]
+  # weighted average test and treat rate among woman
+  if (male == 0 & preg ==0 ){
+      pTestTreat_dt <- data[[5]]
+      pTestTreat <- gen_pTT_woman(pTestTreat_dt, param)
+  }
+  # Initialize transition probability matrix
+  pTrans_mat <- matrix(0,n_state, n_state)
+  # run Markov model and store health transitions over time in the matrix
+  for (i in seq(2,t_horizon)){
+      age <- (i-1)/12 + start_age 
+      if (male == 0 & preg ==0){ # for women, read age-specific probability of testing and treatment (weighted average between non-pregnant and pregnant women)
+        param <- update_pTT_woman(pTestTreat, param, age)
+      }
+      # Update transition matrix with age-specific parameters
+      pTrans_age <- update_pTrans(param, pDie, pDie_TS, pTrans_mat, age)
+      # Markov health transition
+      Markov[i,] <- Markov[i-1,] %*% pTrans_age
+      # Calculate transition to LN (from LL)
+      int_outcome$perc_LN[i] <- Markov[(i-1),LL]*pTrans_age[LL,LN]
+      # Calculate transition to TS (from LL, EN)
+      int_outcome$perc_TS[i] <- Markov[(i-1),LL]*pTrans_age[LL,TS_notx] + Markov[i-1,EN]*pTrans_age[EN,TS_notx]
+  }
+  return(list(Markov,int_outcome))
+
+}
+```
+
+2-7. gen_pTT_woman: This function generates a set of test and treat probability among women. Because women have different rates of testing and treatment depending on the probability of pregnancy and probability of getting screening during antenatal care, we calculate the weighted average of testing and treatment between non-pregnant and pregnant women based on the prevalence of pregnancy by age. Note that this function is only applicable for non pregnant women (male = 0, preg = 0)
+```{r}
+gen_pTT_woman <- function(pTestTreat, param){
+  # pTestTreat: a table of (1) prevalence of pregnancy by age 
+  #                         (2) probability of getting syphilis testing and treatment by age and syphilis stage
+  # param: parameters
+  
+  # test and treat prob among pregnant woman
+  # confert annual probability to monthly probability
+  pTT_preg =  1-exp(log(1-param$pAnteCare * param$pScreenAnteCare * param$pTxSuccess_preg)/12)
+  # calculate weighted average probability of test and treat (weight: prevalence of pregnancy)
+  pTestTreat2 <- pTestTreat %>%
+    mutate(
+      PS = (1-prev_preg/100)*param$pSeekTx_PS + (prev_preg/100)*pTT_preg,
+      SS = (1-prev_preg/100)*param$pSeekTx_SS + (prev_preg/100)*pTT_preg,
+      EL = (1-prev_preg/100)*param$pSeekTx_EL + (prev_preg/100)*pTT_preg,
+      LL = (1-prev_preg/100)*param$pSeekTx_LL + (prev_preg/100)*pTT_preg,
+      EN = (1-prev_preg/100)*param$pEN2Treat + (prev_preg/100)*pTT_preg 
+    )
+  
+  return(pTestTreat2)
+}
+```
+
+2-8. update_pTT_woman: This function updates parameter variable based on the age-specific test and treatment probabilities calculated in the gen_pTT_woman function. 
+```{r}
+update_pTT_woman <- function(pTT,param,age){
+  # pTestTreat: a table of (1) prevalence of pregnancy by age 
+  #                         (2) probability of getting syphilis testing and treatment by age and syphilis stage
+  # param: parameters
+  # age: age in this cycle
+  
+  # Find current age index
+  age_idx <- findInterval(age,pTT$age)
+  # age-specific probability of test and treat
+  param$pSeekTx_PS <- pTT$PS[age_idx]
+  param$pSeekTx_SS <- pTT$SS[age_idx]
+  param$pSeekTx_EL <- pTT$EL[age_idx]
+  param$pSeekTx_LL <- pTT$LL[age_idx]
+  param$pEN2Treat <- pTT$EN[age_idx]
+  
+  return(param)
+}
+
+```
+
+2-9. cal_intoutcome: This function calculates intermediate outcomes such as % of PS progressed to NS or TS in 10,20,30 years
+```{r}
+cal_intoutcome <- function(int_data, out_type){
+  # int_data: a table of proportion of people who transitioned to LN and TS per cycle
+  # out_type: 'LN' if tracking late neurosyphilis 'TS' if tracking tertiary syphilis
+  
+  
+  # calculate cumulative number of late neurosyphilis and tertiary syphilis 
+  int_data <- int_data %>%
+    mutate(
+      cumm_LN = cumsum(perc_LN),
+      cumm_TS = cumsum(perc_TS)
+    )
+  # generate output at cycle = 1, 5, 10, 15, 20, 25, and 30 years after primary syphilis
+  LN_select <- int_data$cumm_LN[c(1,5*12,10*12,15*12,20*12,25*12,30*12)]
+  TS_select <- int_data$cumm_TS[c(1,5*12,10*12,15*12,20*12,25*12,30*12)]
+  # select output type
+  if (out_type == 'LN'){
+    return(LN_select)
+  } else{
+    return(TS_select)
+  }
+}
+```
+
+2-10. This is the main function to generate an outcome dataset with age-specific LE and QALY loss in each subgroup
+```{r}
+main_function <- function(male, msm, preg, data, discount){
+    # male: 1 if male, 0 if female
+    # msm: 1 if msm 0 if msw
+    # preg: 1 if pregnant women 0 if all women
+    # data: 
+    #       data[[1]] parameters 
+    #       data[[2]] age-specific baseline mortality
+    #       data[[3]] tertiary syphilis mortality
+    #       data[[4]] age-specific disutility
+    #       data[[5]] age-specific test and treat probability among women  
+    # discount: 1 if discounting, 0 if not discounting the outcomes
+  
+    # total number of age groups
+    n_age = length(age_list)
+    # Outcome data set
+    QALY_dt <- data.frame(age = age_list, male = male, msm = msm, preg = preg, LE_ps = rep(NA,n_age), LE_healthy = rep(NA,n_age), QALY_ps=rep(NA,n_age), QALY_healthy =rep(NA,n_age))
+    QALY_dt_prop <- data.frame(age = age_list, PS =rep(NA,n_age),SS =rep(NA,n_age),EL =rep(NA,n_age),LL =rep(NA,n_age),TS_notx =rep(NA,n_age),TS =rep(NA,n_age),EN =rep(NA,n_age),LN =rep(NA,n_age),Treated=rep(NA,n_age),Dead_TS=rep(NA,n_age),Dead_other=rep(NA,n_age))
+    int_LN_dt = data.frame(age = age_list, male = male, msm = msm, preg = preg, LN0=rep(NA,n_age), LN5=rep(NA,n_age), LN10=rep(NA,n_age), LN15=rep(NA,n_age), LN20=rep(NA,n_age), LN25=rep(NA,n_age), LN30=rep(NA,n_age))
+    int_TS_dt = data.frame(age = age_list, male = male, msm = msm, preg = preg, TS0=rep(NA,n_age), TS5=rep(NA,n_age), TS10=rep(NA,n_age), TS15=rep(NA,n_age), TS20=rep(NA,n_age), TS25=rep(NA,n_age), TS30=rep(NA,n_age))
+    # calculate QALY loss for all age groups
+    subgroup_label <- ifelse(male==1 & msm==1, 'MSM', ifelse(male==1&msm==0,"MSW",ifelse(male==0&preg==0,"NoPreg","Preg")))
+    print( paste0("This group is ", subgroup_label))
+    for (start_age in age_list){
+      print(paste0("This age is ", start_age))
+      t_horizon <- (end_age - start_age)*12 # time horizon in months
+      init_PS <- c(1,0,0,0,0,0,0,0,0,0,0) # initial state distribution for primary syphilis
+      init_tx <- c(0,0,0,0,0,0,0,0,1,0,0) # initial state distribution for treated syphilis (equivalent to healthy individual)
+      # run Markov for primary syphilis
+      ps_outcome <- run_Markov(init_PS, data, start_age, t_horizon, male, preg)
+      Markov_ps <- ps_outcome[[1]]
+      int_outcome <- ps_outcome[[2]]
+      # life expectancy for primary syphilis
+      QALY_dt$LE_ps[QALY_dt$age == start_age] <- cal_LE(Markov_ps, discount,t_horizon)
+      # QALY for primary syphilis
+      QALY_ps_outcomes <- cal_QALY(Markov_ps, data, discount, t_horizon)
+      QALY_ps <-QALY_ps_outcomes[[1]]
+      QALY_prop <-QALY_ps_outcomes[[2]]
+      QALY_dt$QALY_ps[QALY_dt$age == start_age] <- QALY_ps
+      QALY_dt_prop[QALY_dt_prop$age == start_age,-c(1)] <- QALY_prop
+      # run Markov for a healthy individual
+      Markov_tx <- run_Markov(init_tx, data, start_age, t_horizon, male, preg)[[1]]
+      # life expectancy for a healthy individual 
+      QALY_dt$LE_healthy[QALY_dt$age == start_age] <- cal_LE(Markov_tx, discount, t_horizon)
+      # QALY for a healthy individual 
+      QALY_healthy <- cal_QALY(Markov_tx, data, discount, t_horizon)[[1]]
+      QALY_dt$QALY_healthy[QALY_dt$age == start_age] <- QALY_healthy
+      # For pregnant women, we calculate maternal disutility and babies' lifetime qaly loss at the end of the simulation
+      if (preg == 1 & (start_age == age_list[length(age_list)])){ 
+          # One-time maternal disutility due to congenital syphilis during pregancy (negative value)
+          QALY_preg <- cal_QALY_preg(QALY_ps, QALY_healthy, data, discount)
+          QALY_dt$QALY_ps[QALY_dt$age == start_age] <- QALY_preg
+          # Life-time QALY loss for babies due to congenital syphilis (negative value)
+          if(start_age == age_list[length(age_list)]){
+          QALY_baby <- cal_QALY_baby(data, discount)
+          QALY_dt$QALY_baby <- QALY_baby}
+      }
+      # intermediate outcomes
+      int_LN_dt[QALY_dt$age == start_age,c(5:11)] = cal_intoutcome(int_outcome,'LN')
+      int_TS_dt[QALY_dt$age == start_age,c(5:11)] = cal_intoutcome(int_outcome,'TS')
+    }
+      # Life expectancy loss
+      QALY_dt$LE_loss <- QALY_dt$LE_healthy - QALY_dt$LE_ps
+      # QALY loss
+      QALY_dt$QALY_loss <- QALY_dt$QALY_healthy - QALY_dt$QALY_ps
+
+
+      return(list(QALY_dt,int_LN_dt,int_TS_dt,QALY_dt_prop))}
+```  
+
+2-11. cal_QALY_baby: This function calculates QALY loss among babies with congenital syphilis
+```{r}
+cal_QALY_baby <- function(data, discount){
+  # data: 
+  #       data[[1]] parameters 
+  #       data[[2]] age-specific baseline mortality
+  #       data[[3]] tertiary syphilis mortality
+  #       data[[4]] age-specific disutility
+  #       data[[5]] age-specific test and treat probability among women
+  # discount: 1 if discounting, 0 if not discounting
+  
+  # parameter dataset
+  param <- data[[1]]
+  # loss of QALY life expectancy for stillbirth
+  if(discount == 0){
+    duSB = param$qalyloss_SB_undisc
+  }else{
+    duSB = param$qalyloss_SB
+  }
+  # QALY of infant outcomes
+  CS <- param$pSympCS_others * (-param$duCS_neo) # QALY loss of primary syphilis if congenital syphilis occurs during pregnancy
+  LB <- param$pSympCS_LB * (-param$duLB_neo) # QALY loss of primary syphilis if low birth weight occurs during pregnancy
+  duSymp = CS + LB # QALY loss of symptomatic CS
+  # average QALY Loss of CS (probability of symptomatic CS/asymptomatic CS/still birth * corresponding disutility)
+  duNeo = param$pSympCS*duSymp + param$pAsympCS*0 + param$pSB*(-duSB) 
+
+  return(duNeo)
+}
+
+```
+
+
+2-12. cal_average: this aggregates age-specific QALY loss in a subpopulation- and population- level
+```{r}
+cal_average <- function(QALY_MSM, QALY_MSW, QALY_NoPregW, QALY_PregW){
+  # QALY_MSM: age-specific QALY outcomes among MSM
+  # QALY_MSW: age-specific QALY outcomes among MSW
+  # QALY_NoPregW: age-specific QALY outcomes among non-pregnant women
+  # QALY_PregW: age-specific QALY outcomes among pregnant women
+  
+  aggr_qaly <- data.frame(999)
+  weight <- read.csv(paste0(mydir,"age_weight_syphilis.csv"))
+  weight$p_syphilis_f_preg <- c(c(0,0),weight$p_syphilis_f[3:9]/sum(weight$p_syphilis_f[3:9])*100, c(0,0,0))
+  aggr_qaly <- aggr_qaly %>%
+    mutate(
+      msm = sum(QALY_MSM$QALY_loss * weight$p_syphilis_m/100),
+      msw = sum(QALY_MSW$QALY_loss * weight$p_syphilis_m/100),
+      men = 0.78 * msm + (1-0.78) * msw,
+      nopregw = sum(QALY_NoPregW$QALY_loss * weight$p_syphilis_f/100),
+      women = nopregw,
+      baby = QALY_PregW$QALY_baby[1],
+      preg = QALY_PregW$QALY_ps[1],
+      all = 0.64 * msm + 0.19 * msw + 0.17 * women
+    )
+
+  return(aggr_qaly)
+  
+}
+```
+
+3. Run simulation
+3-1. set up fixed model parameters (This part is supposed to remain unchanged)
+```{r}
+INTEGER = 999  # random integer to fill empty data. if found, means no data
+init_PS = c(1,0,0,0,0,0,0,0,0,0,0) # initial state distribution for primary syphilis
+init_tx = c(0,0,0,0,0,0,0,0,1,0,0) # initial state distribution for treated syphilis (equivalent to healthy individual)
+PS <- 1 # primary syphilis
+SS <- 2 # secondary syphilis
+EL<- 3 # early latent syphilis
+LL <- 4 # late latent syphilis
+TS_notx <- 5 # tertiary syphilis without treatment
+TS <- 6 # tertiary syphilis with treatment
+EN <- 7 # early neurosyphilis
+LN <- 8 # late neurosyphilis
+Treated <- 9 # treated syphilis
+Dead_TS <- 10 # died from tertiary syphilis
+Dead_other <- 11# died from other causes
+State = c('PS', 'SS', 'EL', 'LL','TS_notx','TS','EN','LN','Treated','Dead_TS','Dead_other') # health states
+n_state = length(State) # total number of health states
+```
+
+3-3. Set up model parameters to define subgroups (CHANGE THIS AS YOU NEED)
+```{r}
+# median age of the age groups of interest
+age_list <- c(2,7,12,17,22,27,32,37,42,50,60,76) 
+# age to terminate simulation
+end_age <- 90
+```
+
+3-4. Import basecase parameter values
+```{r} 
+# basecase parameters
+DATA_MSM <- import_data(male=1, msm=1, preg=0)
+DATA_MSW <- import_data(male=1, msm=0, preg=0)
+DATA_W <- import_data(male=0, msm=0, preg=0)
+DATA_PregW <- import_data(male=0, msm=0, preg=1)
+```
+
+3-5. Run simulation for each subgroup
+```{r}
+# discounted QALY outcomes and intermediate outcomes
+# MSM
+MSM_outcome <- main_function(male=1, msm=1, preg=0, DATA_MSM, discount=1)
+this_QALY_dt_MSM <- MSM_outcome[[1]]
+this_LN_dt_MSM <- MSM_outcome[[2]]
+this_TS_dt_MSM <- MSM_outcome[[3]]
+this_QALY_prop_MSM <- MSM_outcome[[4]]
+# MSW
+MSW_outcome <- main_function(male=1, msm=0, preg=0, DATA_MSW, discount=1)
+this_QALY_dt_MSW <- MSW_outcome[[1]]
+this_LN_dt_MSW <- MSW_outcome[[2]]
+this_TS_dt_MSW <- MSW_outcome[[3]]
+this_QALY_prop_MSW <- MSW_outcome[[4]]
+# Non-pregnant women
+NoPregW_outcome <- main_function(male=0, msm=0, preg=0, DATA_W, discount=1)
+this_QALY_dt_NoPregW <- NoPregW_outcome[[1]]
+this_LN_dt_NoPregW <- NoPregW_outcome[[2]]
+this_TS_dt_NoPregW <- NoPregW_outcome[[3]]
+this_QALY_prop_NoPregW <- NoPregW_outcome[[4]]
+# Pregnant women
+PregW_outcome <- main_function(male=0, msm=0, preg=1, DATA_PregW, discount=1)
+this_QALY_dt_PregW <- PregW_outcome[[1]]
+this_LN_dt_PregW <- PregW_outcome[[2]]
+this_TS_dt_PregW <- PregW_outcome[[3]]
+
+# Undiscounted QALY outcomes
+MSM_outcome_nodisc <- main_function(male=1, msm=1, preg=0, DATA_MSM, discount=0)
+this_QALY_dt_MSM2 <- MSM_outcome_nodisc[[1]]
+MSW_outcome_nodisc <- main_function(male=1, msm=0, preg=0, DATA_MSW, discount=0)
+this_QALY_dt_MSW2 <- MSW_outcome_nodisc[[1]]
+NoPregW_outcome_nodisc <- main_function(male=0, msm=0, preg=0, DATA_W, discount=0)
+this_QALY_dt_NoPregW2 <- NoPregW_outcome_nodisc[[1]]
+PregW_outcome_nodisc <- main_function(male=0, msm=0, preg=1, DATA_PregW, discount=0)
+this_QALY_dt_PregW2 <- PregW_outcome_nodisc[1]
+
+# Save outcomes
+# Discounted QALY outcomes
+write.csv(this_QALY_dt_MSM, paste0(myoutdir, paste0("QALY_outcome_MSM_disc.csv")))
+write.csv(this_QALY_dt_MSW, paste0(myoutdir, paste0("QALY_outcome_MSW_disc.csv")))
+write.csv(this_QALY_dt_NoPregW, paste0(myoutdir, paste0("QALY_outcome_NoPregW_disc.csv")))
+write.csv(this_QALY_dt_PregW, paste0(myoutdir, paste0("QALY_outcome_PregW_disc.csv")))
+write.csv(this_QALY_prop_MSM, paste0(myoutdir, paste0("QALYprop_outcome_MSM_disc.csv")))
+write.csv(this_QALY_prop_MSW, paste0(myoutdir, paste0("QALYprop_outcome_MSW_disc.csv")))
+write.csv(this_QALY_prop_NoPregW, paste0(myoutdir, paste0("QALYprop_outcome_NoPregW_disc.csv")))
+# percentage of PS progressed to LN 
+write.csv(this_LN_dt_MSM, paste0(myoutdir, paste0("LN_outcome_MSM_disc.csv")))
+write.csv(this_LN_dt_MSW, paste0(myoutdir, paste0("LN_outcome_MSW_disc.csv")))
+write.csv(this_LN_dt_NoPregW, paste0(myoutdir, paste0("LN_outcome_NoPregW_disc.csv")))
+write.csv(this_LN_dt_PregW, paste0(myoutdir, paste0("LN_outcome_PregW_disc.csv")))
+# percentage of PS progressed to TS
+write.csv(this_TS_dt_MSM, paste0(myoutdir, paste0("TS_outcome_MSM_disc.csv")))
+write.csv(this_TS_dt_MSW, paste0(myoutdir, paste0("TS_outcome_MSW_disc.csv")))
+write.csv(this_TS_dt_NoPregW, paste0(myoutdir, paste0("TS_outcome_NoPregW_disc.csv")))
+write.csv(this_TS_dt_PregW, paste0(myoutdir, paste0("TS_outcome_PregW_disc.csv")))
+# Non-discounted QALY outcomes
+write.csv(this_QALY_dt_MSM2, paste0(myoutdir, paste0("QALY_outcome_MSM_nodisc.csv")))
+write.csv(this_QALY_dt_MSW2, paste0(myoutdir, paste0("QALY_outcome_MSW_nodisc.csv")))
+write.csv(this_QALY_dt_NoPregW2, paste0(myoutdir, paste0("QALY_outcome_NoPregW_nodisc.csv")))
+write.csv(this_QALY_dt_PregW2, paste0(myoutdir, paste0("QALY_outcome_PregW_nodisc.csv")))
+
+# subpopulation- and population-level aggregated outcomes (QALY loss)
+this_QALY_aggr <- cal_average(this_QALY_dt_MSM, this_QALY_dt_MSW, this_QALY_dt_NoPregW, this_QALY_dt_PregW)
+this_QALY_aggr2 <- cal_average(this_QALY_dt_MSM2, this_QALY_dt_MSW2, this_QALY_dt_NoPregW2, this_QALY_dt_PregW2)
+
+print(this_QALY_aggr)
+print(this_QALY_aggr2)
+```
+
+Sensitivity analysis (PSA)
+3-2. Parameter samples to run probabilistic sensitivity analysis. 
+```{r}
+# seed for random number generation
+set.seed(12345)
+# number of samples
+n_sim = 10
+# generate a set of model parameters
+Dur_PS <- rlnorm(n_sim, meanlog = -0.36, sdlog = 0.53)
+Dur_SS <- rlnorm(n_sim, meanlog= 1.3, sdlog = 0.26)
+Dur_EL <- 12 - Dur_PS - Dur_SS
+pNeuro <- rbeta(n_sim, 3.5, 7.1)
+pNS_early <- rbeta(n_sim, 5.7, 107.4) 
+pNS_late <- rbeta(n_sim, 31.4, 317.2)
+pNS_late <- 1-exp(log(1-pNS_late)/180) #transform to monthly probability
+pEN2TS <- rbeta(n_sim, 17.8, 53.3)
+pEN2TS <- 1-exp(log(1-pEN2TS)/240) # transform to monthly probability
+pTxSuccess_early <- 1 - rbeta(n_sim, 3.6, 68.4)
+pTxSuccess_late <- 1 - rbeta(n_sim, 9.1, 38.8)
+pTS2Treat <- rep(0,n_sim)
+pEN2Treat <- rbeta(n_sim, 21.4, 9.2)
+pEN2Treat <- 1-exp(log(1-pEN2Treat)/6) # transform to monthly probability
+uPS <- 1-rbeta(n_sim, 3.8, 631.6) 
+uSS <- 1-rbeta(n_sim, 14.7, 343.7) 
+uEL <- rep(1-0,n_sim)
+uLL <- rep(1-0,n_sim)
+uTS_notx <- 1-rbeta(n_sim, 21.0,	65.3) 
+uTS <-  1-rbeta(n_sim, 13.8, 133.3) #uTS_notx 
+uEN <- 1-rbeta(n_sim, 14.5,276.4) 
+uLN <- 1-rbeta(n_sim, 16.5,	64.6) #uTS_notx 
+uTreat<-rep(1,n_sim)
+uDead_TS<-rep(0,n_sim)
+uDead_other <-rep(0,n_sim)
+
+pSeekTx_PS_MSM <- rbeta(n_sim, 2.0, 1.7) 
+pSeekTx_PS_MSM <- 1-exp(log(1-pSeekTx_PS_MSM)/12)
+pSeekTx_SS_MSM <- rbeta(n_sim, 3.8, 1.2) 
+pSeekTx_SS_MSM <- 1-exp(log(1-pSeekTx_SS_MSM)/12)
+pSeekTx_EL_MSM <- rbeta(n_sim, 1.8, 2.3) 
+pSeekTx_EL_MSM <- 1-exp(log(1-pSeekTx_EL_MSM)/12)
+pSeekTx_LL_MSM <- pSeekTx_EL_MSM 
+pSeekTx_PS_others <- rbeta(n_sim, 1.7, 3.9) 
+pSeekTx_PS_others <- 1-exp(log(1-pSeekTx_PS_others)/12)
+pSeekTx_SS_others <- rbeta(n_sim, 3.5, 3.4) 
+pSeekTx_SS_others <- 1-exp(log(1-pSeekTx_SS_others)/12)
+pSeekTx_EL_others <- rbeta(n_sim, 1.2, 5.3)  
+pSeekTx_EL_others <- 1-exp(log(1-pSeekTx_EL_others)/12)
+pSeekTx_LL_others <- pSeekTx_EL_others#1-exp(log(1-pSeekTx_LL_others)/12)
+
+pAnteCare <- rbeta(n_sim, 1.297, 0.026) 
+pScreenAnteCare <- rbeta(n_sim, 11.1, 0.584) 
+pTxSuccess_preg <- rbeta(n_sim, 17.7, 3.1)
+duCS_mat <-  rbeta(n_sim, 1.4, 10.1) 
+duCS_neo <-  rbeta(n_sim, 9.5, 27.2) 
+duLB_mat <- rbeta(n_sim, 0.000006, 0.11) 
+duLB_neo <- rbeta(n_sim, 12.1, 102.9) 
+duSB_mat <- rbeta(n_sim, 1.5, 17.1) 
+duND_mat <- rbeta(n_sim, 46.5, 147.2)
+pStageatDiag <- rdirichlet(n_sim, c(0.784, 0.170, 0.046)*5000) # sample size is random(5000)
+pDiagPS <- pStageatDiag[,1]
+pDiagSS <- pStageatDiag[,2]
+pDiagEL <- pStageatDiag[,3]
+du_DiagPS <- 1- uPS #rep(0.00504, n_sim)
+du_DiagSS <- du_DiagPS + (1-uSS)/((1+0.03)^(1/12)) + (1-uSS)/((1+0.03)^(2/12)) #rep(0.124, n_sim)
+du_DiagEL <- du_DiagSS #rep(0.124, n_sim)
+pCS_all <- rdirichlet(n_sim, c(0.33, 0.61, 0.06)*1306)
+pSympCS <- pCS_all[,1]
+pAsympCS <- pCS_all[,2]
+pSB <- pCS_all[,3]
+pSympCS_all <- rdirichlet(n_sim, c(0.27,0.73)*1306)
+pSympCS_LB <-pSympCS_all[,1]
+pSympCS_others <- pSympCS_all[,2]
+qalyloss_SB <- rep(28.47961,n_sim)
+qalyloss_SB_undisc <- rep(70,n_sim)
+# parameters for MSM
+data_MSM <- data.frame(t(rbind(Dur_PS,Dur_SS,Dur_EL,pNeuro,pNS_early,pNS_late,pEN2TS,pTxSuccess_early,pTxSuccess_late,pTS2Treat,pEN2Treat,uPS,uSS,uEL,uLL,uTS_notx,uTS,uEN,uLN,uTreat,uDead_TS,uDead_other,pSeekTx_PS_MSM,pSeekTx_SS_MSM,pSeekTx_EL_MSM,pSeekTx_LL_MSM)))
+colnames(data_MSM)[23:26] <- c("pSeekTx_PS", "pSeekTx_SS", "pSeekTx_EL", "pSeekTx_LL")
+# parameters for MSW and non-pregnant women
+data_others <- data.frame(t(rbind(Dur_PS,Dur_SS,Dur_EL,pNeuro,pNS_early,pNS_late,pEN2TS,pTxSuccess_early,pTxSuccess_late,pTS2Treat,pEN2Treat,uPS,uSS,uEL,uLL,uTS_notx,uTS,uEN,uLN,uTreat,uDead_TS,uDead_other,pSeekTx_PS_others,pSeekTx_SS_others,pSeekTx_EL_others,pSeekTx_LL_others)))
+colnames(data_others)[23:26] <- c("pSeekTx_PS", "pSeekTx_SS", "pSeekTx_EL", "pSeekTx_LL")
+# parameters for pregnant women
+data_preg <- data.frame(t(rbind(Dur_PS,Dur_SS,Dur_EL,pNeuro,pNS_early,pNS_late,pEN2TS,pTxSuccess_early,pTxSuccess_late,pTS2Treat,pEN2Treat,uPS,uSS,uEL,uLL,uTS_notx,uTS,uEN,uLN,uTreat,uDead_TS,uDead_other,pSeekTx_PS_others,pSeekTx_SS_others,pSeekTx_EL_others,pSeekTx_LL_others,pAnteCare,pScreenAnteCare,pTxSuccess_preg, duCS_mat, duCS_neo, duLB_mat, duLB_neo, duSB_mat, duND_mat, pDiagPS, pDiagSS, pDiagEL, du_DiagPS, du_DiagSS, du_DiagEL,pSympCS, pAsympCS,  pSB, pSympCS_LB, pSympCS_others, qalyloss_SB, qalyloss_SB_undisc)))
+colnames(data_preg)[23:26] <- c("pSeekTx_PS", "pSeekTx_SS", "pSeekTx_EL", "pSeekTx_LL")
+# Save parameter samples for probabilistic sensitivity analysis
+write.csv(data_MSM, paste0(myoutdir, "PSA_samples_MSM.csv"))
+write.csv(data_others, paste0(myoutdir, "PSA_samples_others.csv"))
+write.csv(data_preg, paste0(myoutdir, "PSA_samples_preg.csv"))
+```
+
+
+Run PSA 
+```{r}
+data_MSM <- read.csv(paste0(myoutdir, "PSA_samples_MSM.csv"))
+data_others <- read.csv(paste0(myoutdir, "PSA_samples_others.csv"))
+data_preg <- read.csv(paste0(myoutdir, "PSA_samples_preg.csv"))
+for (i in c(1:n_sim)){
+    print(paste0 ("PSA sample #",i))
+    # import subgroup-specific data for transition matrix
+    DATA_MSM <- import_data(male=1, msm=1, preg=0)
+    DATA_MSM[[1]] <- data_MSM[i,] # replace parameter with the sampled parameter 
+    DATA_MSW <- import_data(male=1, msm=0, preg=0)
+    DATA_MSW[[1]] <- data_others[i,] # replace parameter with the sampled parameter 
+    DATA_NoPregW <- import_data(male=0, msm=0, preg=0)
+    DATA_NoPregW[[1]] <- data_preg[i,] # replace parameter with the sampled parameter 
+    DATA_PregW <- import_data(male=0, msm=0, preg=1)
+    DATA_PregW[[1]] <- data_preg[i,] # replace parameter with the sampled parameter 
+    
+    # QALYs lost
+    #discounted
+    this_outcome_MSM <- main_function(male=1, msm=1, preg=0, DATA_MSM, discount=1)
+    this_QALY_dt_MSM <- this_outcome_MSM[[1]]
+    this_QALY_dt_MSM$n_sim <- i
+    this_outcome_MSW <- main_function(male=1, msm=0, preg=0, DATA_MSW, discount=1)
+    this_QALY_dt_MSW <- this_outcome_MSW[[1]]
+    this_QALY_dt_MSW$n_sim <- i
+    this_outcome_NoPregW <- main_function(male=0, msm=0, preg=0, DATA_NoPregW, discount=1)
+    this_QALY_dt_NoPregW <- this_outcome_NoPregW[[1]]
+    this_QALY_dt_NoPregW$n_sim <- i
+    this_QALY_dt_PregW <- main_function(male=0, msm=0, preg=1, DATA_PregW, discount=1)[[1]]
+    this_QALY_dt_PregW$n_sim <- i
+    #undiscounted
+    this_QALY_dt_MSM2 <- main_function(male=1, msm=1, preg=0, DATA_MSM, discount=0)[[1]]
+    this_QALY_dt_MSM2$n_sim <- i
+    this_QALY_dt_MSW2 <- main_function(male=1, msm=0, preg=0, DATA_MSW, discount=0)[[1]]
+    this_QALY_dt_MSW2$n_sim <- i
+    this_QALY_dt_NoPregW2 <- main_function(male=0, msm=0, preg=0, DATA_NoPregW, discount=0)[[1]]
+    this_QALY_dt_NoPregW2$n_sim <- i
+    this_QALY_dt_PregW2 <- main_function(male=0, msm=0, preg=1, DATA_PregW, discount=0)[[1]]
+    this_QALY_dt_PregW2$n_sim <- i
+    
+    #average QALYs lost
+    this_QALY_aggr <- cal_average(this_QALY_dt_MSM, this_QALY_dt_MSW, this_QALY_dt_NoPregW, this_QALY_dt_PregW)
+    this_QALY_aggr2 <- cal_average(this_QALY_dt_MSM2, this_QALY_dt_MSW2, this_QALY_dt_NoPregW2, this_QALY_dt_PregW2)
+    
+    # Proportion of QALYs lost
+    this_QALY_prop_MSM <- this_outcome_MSM[[4]]
+    this_QALY_prop_MSM$n_sim <- i
+    this_QALY_prop_MSW <- this_outcome_MSW[[4]]
+    this_QALY_prop_MSW$n_sim <- i
+    this_QALY_prop_NoPregW <- this_outcome_NoPregW[[4]]
+    this_QALY_prop_NoPregW$n_sim <- i
+    
+    # save PSA outcomes
+    if (i == 1){
+      QALY_dt_all_MSM <- this_QALY_dt_MSM
+      QALY_dt_all_MSW <- this_QALY_dt_MSW
+      QALY_dt_all_NoPregW <- this_QALY_dt_NoPregW
+      QALY_dt_all_PregW <- this_QALY_dt_PregW
+      QALY_all_aggr <- this_QALY_aggr
+      QALY_dt_all_MSM2 <- this_QALY_dt_MSM2
+      QALY_dt_all_MSW2 <- this_QALY_dt_MSW2
+      QALY_dt_all_NoPregW2 <- this_QALY_dt_NoPregW2
+      QALY_dt_all_PregW2 <- this_QALY_dt_PregW2
+      QALY_all_aggr2 <- this_QALY_aggr2
+      QALY_prop_all_MSM <- this_QALY_prop_MSM
+      QALY_prop_all_MSW <- this_QALY_prop_MSW
+      QALY_prop_all_NoPregW <- this_QALY_prop_NoPregW
+      }
+    else{
+      QALY_dt_all_MSM <- rbind(QALY_dt_all_MSM, this_QALY_dt_MSM)
+      QALY_dt_all_MSW <- rbind(QALY_dt_all_MSW, this_QALY_dt_MSW)
+      QALY_dt_all_NoPregW <- rbind(QALY_dt_all_NoPregW, this_QALY_dt_NoPregW)
+      QALY_dt_all_PregW <- rbind(QALY_dt_all_PregW, this_QALY_dt_PregW)
+      QALY_all_aggr <- rbind(QALY_all_aggr, this_QALY_aggr)
+      QALY_dt_all_MSM2 <- rbind(QALY_dt_all_MSM2, this_QALY_dt_MSM2)
+      QALY_dt_all_MSW2 <- rbind(QALY_dt_all_MSW2, this_QALY_dt_MSW2)
+      QALY_dt_all_NoPregW2 <- rbind(QALY_dt_all_NoPregW2, this_QALY_dt_NoPregW2)
+      QALY_dt_all_PregW2 <- rbind(QALY_dt_all_PregW2, this_QALY_dt_PregW2)
+      QALY_all_aggr2 <- rbind(QALY_all_aggr2, this_QALY_aggr2)
+      QALY_prop_all_MSM <- rbind(QALY_prop_all_MSM, this_QALY_prop_MSM)
+      QALY_prop_all_MSW<- rbind(QALY_prop_all_MSW, this_QALY_prop_MSW)
+      QALY_prop_all_NoPregW <- rbind(QALY_prop_all_NoPregW, this_QALY_prop_NoPregW)
+      }
+}
+    
+
+# Save all outcomes
+write.csv(QALY_dt_all_MSM, paste0(myoutdir, paste0("PSAall_QALY_outcome2_", paste0('MSM', ".csv"))))
+write.csv(QALY_dt_all_MSW, paste0(myoutdir, paste0("PSAall_QALY_outcome2_", paste0('MSW', ".csv"))))
+write.csv(QALY_dt_all_NoPregW, paste0(myoutdir, paste0("PSAall_QALY_outcome2_", paste0('NoPregW', ".csv"))))
+write.csv(QALY_dt_all_PregW, paste0(myoutdir, paste0("PSAall_QALY_outcome2_", paste0('PregW', ".csv"))))
+write.csv(QALY_all_aggr, paste0(myoutdir, "PSAaggr_QALY_outcome2.csv"))
+write.csv(QALY_dt_all_MSM2, paste0(myoutdir, paste0("PSAall_QALY_outcome2(nodisc)_", paste0('MSM', ".csv"))))
+write.csv(QALY_dt_all_MSW2, paste0(myoutdir, paste0("PSAall_QALY_outcome2(nodisc)_", paste0('MSW', ".csv"))))
+write.csv(QALY_dt_all_NoPregW2, paste0(myoutdir, paste0("PSAall_QALY_outcome2(nodisc)_", paste0('NoPregW', ".csv"))))
+write.csv(QALY_dt_all_PregW2, paste0(myoutdir, paste0("PSAall_QALY_outcome2(nodisc)_", paste0('PregW', ".csv"))))
+write.csv(QALY_all_aggr2, paste0(myoutdir, "PSAaggr_QALY_outcome2(nodisc).csv"))
+write.csv(QALY_prop_all_MSM, paste0(myoutdir, paste0("PSAall_QALYprop_outcome2_", paste0('MSM', ".csv"))))
+write.csv(QALY_prop_all_MSW, paste0(myoutdir, paste0("PSAall_QALYprop_outcome2_", paste0('MSW', ".csv"))))
+write.csv(QALY_prop_all_NoPregW, paste0(myoutdir, paste0("PSAall_QALYprop_outcome2_", paste0('NoPregW', ".csv"))))
+# Save summary outcomes (age-specific)
+save_summary <- function(psa_all, subgroup,discount){
+  if(discount == 0){
+    filename = "PSAsum_QALY_outcome2(nodisc)_"
+  } else{
+        filename = "PSAsum_QALY_outcome2_"
+  }
+  # summary table
+  if(subgroup == 'PregW'){# if pregnant woman, add column of qaly loss for child
+    summary <- psa_all %>%
+      group_by(age) %>%
+      summarize(mother_mean = mean(QALY_ps),mother_lb=quantile(QALY_ps,probs=c(0.025)),mother_ub=quantile(QALY_ps,probs=c(0.975)),
+                baby_mean = mean(QALY_baby),baby_lb=quantile(QALY_baby,probs=c(0.025)),baby_ub=quantile(QALY_baby,probs=c(0.975)))
+  } else{
+    summary <- psa_all %>%
+        group_by(age) %>%
+        summarize(mean = mean(QALY_loss), lb = quantile(QALY_loss, probs = c(0.025)), ub = quantile(QALY_loss, probs = c(0.975)))
+  }
+  write.csv(summary, paste0(myoutdir, paste0(filename, paste0(subgroup, ".csv"))))
+}
+save_summary_prop <- function(psa_all, subgroup,discount){
+  filename = "PSAsum_QALYprop_"
+  summary <- psa_all %>%
+      group_by(age) %>%
+      summarize(PS_mean = mean(PS),
+                PS_lb = quantile(PS, probs = c(0.025)), 
+                PS_ub = quantile(PS, probs = c(0.975)),
+                SS_mean = mean(SS),
+                SS_lb = quantile(SS, probs = c(0.025)), 
+                SS_ub = quantile(SS, probs = c(0.975)),
+                TS_notx_mean = mean(TS_notx),
+                TS_notx_lb = quantile(TS_notx, probs = c(0.025)), 
+                TS_notx_ub = quantile(TS_notx, probs = c(0.975)),
+                TS_mean = mean(TS),
+                TS_lb = quantile(TS, probs = c(0.025)), 
+                TS_ub = quantile(TS, probs = c(0.975)),
+                EN_mean = mean(EN),
+                EN_lb = quantile(EN, probs = c(0.025)), 
+                EN_ub = quantile(EN, probs = c(0.975)),
+                LN_mean = mean(LN),
+                LN_lb = quantile(LN, probs = c(0.025)), 
+                LN_ub = quantile(LN, probs = c(0.975)),                
+                Dead_TS_mean = mean(Dead_TS),
+                Dead_TS_lb = quantile(Dead_TS, probs = c(0.025)), 
+                Dead_TS_ub = quantile(Dead_TS, probs = c(0.975)),               
+                )
+  
+  write.csv(summary, paste0(myoutdir, paste0(filename, paste0(subgroup, ".csv"))))
+}
+
+save_summary(QALY_dt_all_MSM, "MSM",1)
+save_summary(QALY_dt_all_MSW, "MSW",1)
+save_summary(QALY_dt_all_NoPregW, "NoPregW",1)
+save_summary(QALY_dt_all_PregW, "PregW",1)
+save_summary(QALY_dt_all_MSM2, "MSM",0)
+save_summary(QALY_dt_all_MSW2, "MSW",0)
+save_summary(QALY_dt_all_NoPregW2, "NoPregW",0)
+save_summary(QALY_dt_all_PregW2, "PregW",0)
+save_summary_prop(QALY_prop_all_MSM, "MSM",1)
+save_summary_prop(QALY_prop_all_MSW, "MSW",1)
+save_summary_prop(QALY_prop_all_NoPregW, "NoPregW",1)
+
+# Save summary outcomes (average in a subgroup/population)
+avg_mean <- sapply(QALY_all_aggr, function(x) mean(x))
+avg_lb <- sapply(QALY_all_aggr, function(x) quantile(x, 0.025))
+avg_ub <- sapply(QALY_all_aggr, function(x) quantile(x, 0.975))
+avg_mean2 <- sapply(QALY_all_aggr2, function(x) mean(x))
+avg_lb2 <- sapply(QALY_all_aggr2, function(x) quantile(x, 0.025))
+avg_ub2 <- sapply(QALY_all_aggr2, function(x) quantile(x, 0.975))
+
+write.csv(avg_mean, paste0(myoutdir, "PSAavg_QALY_outcome_mean2.csv"))
+write.csv(avg_lb, paste0(myoutdir, "PSAavg_QALY_outcome_lb2.csv"))
+write.csv(avg_ub, paste0(myoutdir, "PSAavg_QALY_outcome_ub2.csv"))
+write.csv(avg_mean2, paste0(myoutdir, "PSAavg_QALY_outcome_mean2(nodisc).csv"))
+write.csv(avg_lb2, paste0(myoutdir, "PSAavg_QALY_outcome_lb2(nodisc).csv"))
+write.csv(avg_ub2, paste0(myoutdir, "PSAavg_QALY_outcome_ub2(nodisc).csv"))
+
+```
+
+
+Once you run base-case and PSA, update the file 'Syphilis_result_all.xlsx'
+```{r}
+##############################
+# Paper Figures
+##############################
+
+#1. Age-specific QALY loss
+plot_ageQALY <- function(age_QALY, discount) {
+  if (discount == 1){
+    this_title = "Discounted"
+  } else{
+    this_title = "Not discounted"
+  }
+  # select age groups of interest
+  age_QALY_lb <- age_QALY %>%
+    select(Age,MSM_lb,MSW_lb,Women_lb) %>%
+    filter(!Age %in% c("0-4","5-9")) 
+  age_QALY_ub <- age_QALY %>%
+    select(Age,MSM_ub,MSW_ub,Women_ub) %>%
+    filter(!Age %in% c("0-4","5-9")) 
+  age_QALY <- age_QALY %>%
+    mutate(
+      Age = factor(age_QALY$Age, levels = c("0-4","5-9","10-14","15-19","20-24","25-29","30-34","35-39","40-44","45-54","55-64","65+"))
+    ) %>%
+    filter(!Age %in% c("0-4","5-9")) %>%
+    select(Age,MSM,MSW,Women)
+  # long-form
+  age_QALY_t <- melt(age_QALY, id.vars= 'Age')
+  age_QALY_lb_t <- melt(age_QALY_lb, id.var="Age")
+  age_QALY_ub_t <- melt(age_QALY_ub, id.var="Age")
+  age_QALY_t_range <- cbind(age_QALY_lb_t, age_QALY_ub_t$value)
+  colnames(age_QALY_t_range) <- c("Age","variable","lb","ub")
+  age_QALY_t_range$variable <- factor(age_QALY_t_range$variable, levels = levels(age_QALY_t_range$variable), labels = c("MSW","MSM","Women"))
+  # plot
+  this_plot <- ggplot() +
+    geom_bar(data = age_QALY_t, aes(x = Age, y = value, fill = variable),position = "dodge",stat = "identity", width = 0.6)+
+    geom_errorbar(data = age_QALY_t_range, aes(x = Age, ymin = lb, ymax = ub, group=variable), width = 0.6, size= 0.1, position = "dodge")+
+    xlab("Age at infection (years)")+
+    ylab("QALYs lost per infection")+
+    labs(title = this_title)+
+    scale_y_continuous(expand = c(0,0), limits = c(0,max(age_QALY_ub_t$value)+0.1))+
+    theme(
+      # backgrounds
+      panel.grid.major = element_blank(), panel.grid.minor= element_blank(), panel.background = element_blank(), axis.line=element_line(colour = "black"), legend.key = element_blank(),
+      # title
+      plot.title = element_text(hjust = 0.5, vjust = 1.5, size = 15),
+      legend.title=element_blank(),
+      legend.text=element_text(size = 10),
+      legend.position = c(0.9,0.9),
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text.x = element_text(size = 11, angle = 30, margin = margin(t=10)),
+      axis.text.y = element_text(size = 11),
+      strip.text.x = element_text(size = 11))+
+      scale_fill_manual(values = c("royalblue1","olivedrab","tomato"))
+  
+  return(this_plot)
+}
+age_QALY <- read.xlsx(paste0(myoutdir,"Syphilis_result_all.xlsx"), sheet='age_QALY_psa')
+age_QALY_nodisc <- read.xlsx(paste0(myoutdir,"Syphilis_result_all.xlsx"), sheet='age_QALY_psa (nodisc)')
+plt_ageQALY_disc <- plot_ageQALY(age_QALY, discount=1)
+plt_ageQALY_nodisc <- plot_ageQALY(age_QALY_nodisc, discount=0)
+
+ggarrange(plt_ageQALY_disc, plt_ageQALY_nodisc, labels = c("A","B"), ncol = 2, nrow = 1, common.legend=TRUE, legend ="bottom")
+ggsave(paste0(myoutdir, "ageQALY_revised.pdf"), width=9,height = 5)
+
+# 2. Average lifetime QALY loss per syphilis infection
+plot_avgQALY_inner <- function(avg_QALY_dt, vars, discount){
+  if(vars == 'perinf'){
+    varname = 'avg_QALY'
+    varname_lb = 'avg_QALY_lb'
+    varname_ub = 'avg_QALY_ub'
+    this_ylab = "QALYs lost per infection"
+    if (discount == 0){
+      this_ylim = 0.9
+    } else{
+      this_ylim=0.4
+    }
+  } else{
+    varname = 'tot_QALY'
+    varname_lb = 'tot_QALY_lb'
+    varname_ub = 'tot_QALY_ub'
+    this_ylab = "Total QALYs lost"
+     if (discount == 0){
+      this_ylim = 105000
+    } else{
+      this_ylim=50000
+    }   
+  }
+  this_plot <- ggplot()+
+     geom_bar(data = avg_QALY_dt, aes(x = pop, y = avg_QALY_dt[,varname], fill = pop),position = "dodge",stat = "identity", width = 0.6)+
+     geom_errorbar(data = avg_QALY_dt, aes(x = pop, ymin = avg_QALY_dt[,varname_lb], ymax = avg_QALY_dt[,varname_ub]), width = 0.3, size= 0.1, position = "dodge")+
+    ylab(this_ylab)+
+    scale_y_continuous(expand = c(0,0), limits = c(0,this_ylim))+
+    theme(
+      # backgrounds
+      panel.grid.major = element_blank(), panel.grid.minor= element_blank(), panel.background = element_blank(), axis.line=element_line(colour = "black"), legend.key = element_blank(),
+      # title
+      plot.title = element_text(hjust = 0.5, vjust = 1.5, size = 15),
+      legend.title=element_blank(),
+      legend.text=element_text(size = 10),
+      legend.position = 'none',
+      axis.title.x = element_blank(),
+      axis.title.y = element_text(size = 12),
+      axis.text.x = element_text(size = 11, angle = 30, margin = margin(t=10)),
+      axis.text.y = element_text(size = 11))+
+      #strip.text.x = element_text(size = 11)) +
+    scale_fill_manual(values = c("royalblue1","olivedrab","steelblue4","tomato","grey47"))
+  return(this_plot)
+}
+plot_avgQALY <- function(avg_QALY, avg_QALY_nodisc){
+  avg_QALY$pop <- factor(avg_QALY$pop, levels = c("MSM","MSW","Men","Women","Population"))
+  avg_QALY_nodisc$pop <- factor(avg_QALY_nodisc$pop, levels = c("MSM","MSW","Men","Women","Population"))
+  QALY_perinf <- plot_avgQALY_inner(avg_QALY, "perinf", discount=1)
+  QALY_totinf <- plot_avgQALY_inner(avg_QALY, "totinf", discount=1)
+  QALY_perinf_nodisc <- plot_avgQALY_inner(avg_QALY_nodisc, "perinf", discount=0)
+  QALY_totinf_nodisc <- plot_avgQALY_inner(avg_QALY_nodisc, "totinf", discount=0)  
+  comb_plot <- ggarrange(QALY_perinf, QALY_perinf_nodisc,QALY_totinf,QALY_totinf_nodisc, labels = c("A","B","C","D"),ncol = 2, nrow = 2, common.legend=TRUE, legend ="bottom")
+  
+  return(comb_plot)
+}
+avg_QALY <- read.xlsx(paste0(myoutdir, "Syphilis_result_all.xlsx"), sheet = 'avg_QALY_psa')
+avg_QALY_nodisc <- read.xlsx(paste0(myoutdir, "Syphilis_result_all.xlsx"), sheet = 'avg_QALY_psa (nodisc)')
+plt_avgQALY_comb <- plot_avgQALY(avg_QALY, avg_QALY_nodisc)
+ggsave(paste0(myoutdir, "avgQALY_revised(spicknall).pdf"), width=10,height = 10)
+
+
+
+#3. QALY loss due to congenital syphilis
+avg_QALY_cong <- read.xlsx(paste0(myoutdir, "Syphilis_result_all.xlsx"), sheet = 'avg_QALY_cong_psa')
+avg_QALY_cong_nodisc <- read.xlsx(paste0(myoutdir, "Syphilis_result_all.xlsx"), sheet = 'avg_QALY_cong_psa (nodisc)')
+avg_QALY_cong_nodisc$pop <- c("mother (not discounted)", "child (not discounted)")
+avg_QALY_cong <- rbind(avg_QALY_cong,avg_QALY_cong_nodisc)
+avg_QALY_cong$pop <- factor(avg_QALY_cong$pop, levels = c("mother","mother (not discounted)","child", "child (not discounted)"), labels=c("Mother (discounted)","Mother (not discounted)","Child (discounted)", "Child (not discounted)"))
+
+QALY_perinf <- ggplot(data = avg_QALY_cong, aes(x = pop, y = avg_QALY, fill = pop))+
+   geom_bar(position = "dodge",stat = "identity", width = 0.6)+
+   geom_errorbar(aes(x = pop, ymin = avg_QALY_lb, ymax = avg_QALY_ub), width = 0.3, size= 0.1, position = "dodge")+
+  ylab("QALYs lost per infection")+
+  scale_y_continuous(expand = c(0,0), limits=c(0,max(avg_QALY_cong$avg_QALY_ub)+0.1))+
+  theme(
+    # backgrounds
+    panel.grid.major = element_blank(), panel.grid.minor= element_blank(), panel.background = element_blank(), axis.line=element_line(colour = "black"), legend.key = element_blank(),
+    # title
+    plot.title = element_text(hjust = 0.5, vjust = 1.5, size = 15),
+    legend.title=element_blank(),
+    legend.text=element_text(size = 11),
+    #legend.position = 'bottom',
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = 13),
+    axis.text.x = element_text(size = 12, angle = 30, margin = margin(t=10),hjust=0.8),
+    axis.text.y = element_text(size = 12))+
+    #strip.text.x = element_text(size = 11)) +
+  scale_fill_manual(values = c("palevioletred","palevioletred4","orange1", "orange3"))
+
+QALY_totinf <- ggplot(data = avg_QALY_cong, aes(x = pop, y = tot_QALY, fill = pop))+
+   geom_bar(position = "dodge",stat = "identity", width = 0.6)+
+   geom_errorbar(aes(x = pop, ymin = tot_QALY_lb, ymax = tot_QALY_ub), width = 0.3, size= 0.1, position = "dodge")+
+  ylab("Total QALYs lost")+
+  scale_y_continuous(expand = c(0,0), limits = c(0,max(avg_QALY_cong$tot_QALY_ub)+20))+
+  theme(
+    # backgrounds
+    panel.grid.major = element_blank(), panel.grid.minor= element_blank(), panel.background = element_blank(), axis.line=element_line(colour = "black"), legend.key = element_blank(),
+    # title
+    plot.title = element_text(hjust = 0.5, vjust = 1.5, size = 15),
+    legend.title=element_blank(),
+    legend.text=element_text(size = 11),
+    #legend.position = 'bottom',
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = 13),
+    axis.text.x = element_text(size = 12, angle = 30, margin = margin(t=10),hjust=0.8),
+    axis.text.y = element_text(size = 12))+
+    #strip.text.x = element_text(size = 11)) +
+  scale_fill_manual(values = c("palevioletred","palevioletred4","orange1", "orange3"))
+
+ggarrange(QALY_perinf, QALY_totinf,  ncol = 2, nrow = 1, labels = c("A","B"),common.legend=TRUE, legend ="bottom")
+ggsave(paste0(myoutdir, "CS_QALY(spicknall).pdf"), width=8,height = 5.5)
+
+# Appendix 5. Age-specific QALY loss by pregnancy status among women
+age_QALY <- read.xlsx(paste0(myoutdir,"Syphilis_result_all.xlsx"), sheet='age_QALY_psa')
+age_QALY$Age <- factor(age_QALY$Age, levels = c("0-4","5-9","10-14","15-19","20-24","25-29","30-34","35-39","40-44","45-54","55-64","65+"))
+age_QALY_lb <- age_QALY[,c("Age",'Pregnant.women_lb','Non-pregnant.women_lb','Women_lb')]
+age_QALY_ub <- age_QALY[,c("Age",'Pregnant.women_ub','Non-pregnant.women_ub','Women_ub')]
+age_QALY <- age_QALY[,c("Age",'Pregnant.women','Non-pregnant.women','Women')]
+age_QALY_t <- melt(age_QALY, id.vars= 'Age')
+age_QALY_lb_t <- melt(age_QALY_lb, id.var="Age")
+age_QALY_ub_t <- melt(age_QALY_ub, id.var="Age")
+age_QALY_t_range <- cbind(age_QALY_lb_t, age_QALY_ub_t$value)
+colnames(age_QALY_t_range) <- c("Age","variable","lb","ub")
+age_QALY_t_range$variable <- factor(age_QALY_t_range$variable, levels = levels(age_QALY_t_range$variable), labels = c("Pregnant","Non-pregnant","All women"))
+ggplot() +
+  geom_bar(data = age_QALY_t, aes(x = Age, y = value, fill = variable),position = "dodge",stat = "identity", width = 0.6)+
+  geom_errorbar(data = age_QALY_t_range, aes(x = Age, ymin = lb, ymax = ub, group=variable), width = 0.6, size= 0.1, position = "dodge")+
+  xlab("Age at syphilis infection")+
+  ylab("QALY loss per infection (QALYs)")+
+  labs(title = "Lifetime QALY Loss per syphilis infection")+
+  scale_y_continuous(expand = c(0,0))+
+  theme(
+    # backgrounds
+    panel.grid.major = element_blank(), panel.grid.minor= element_blank(), panel.background = element_blank(), axis.line=element_line(colour = "black"), legend.key = element_blank(),
+    # title
+    plot.title = element_text(hjust = 0.5, vjust = 1.5, size = 15),
+    legend.title=element_blank(),
+    legend.text=element_text(size = 10),
+    #legend.position = 'bottom',
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 11, angle = 30, margin = margin(t=10)),
+    axis.text.y = element_text(size = 11),
+    strip.text.x = element_text(size = 11))+
+    scale_fill_manual(values = c("palevioletred","gold3","tomato"))
+
+## 4. Intermediate outcomes ##
+# 4-1. late neurosyphilis
+plot_intoutcome <- function(int_outtype){
+  subgroup_list <- c("MSM","MSW","NoPregW")
+  for (this_group in subgroup_list){
+    temp_LN <- read.csv(paste0(myoutdir, int_outtype,"_outcome_",this_group,"_disc.csv"))
+    temp_LN_t <- melt(temp_LN %>% select(-X,-male,-msm,-preg), id.vars="age")
+    temp_LN_t$sg = this_group
+    if(this_group == 'MSM'){
+      temp_LN_all = temp_LN_t
+    }else{
+      temp_LN_all = rbind(temp_LN_all, temp_LN_t)
+    }
+  }
+  temp_LN_all$age <- as.factor(temp_LN_all$age)
+  temp_LN_all$age <- factor(temp_LN_all$age,levels = levels(temp_LN_all$age), labels = c("0-4","5-9","10-14","15-19","20-24","25-29","30-34","35-39","40-44","45-54","55-64","65+"))
+  temp_LN_all$variable <- factor(temp_LN_all$variable, levels=levels(temp_LN_all$variable),labels=c("0","5","10","15","20","25","30"))
+  temp_LN_all$sg <- as.factor(temp_LN_all$sg)
+  temp_LN_all$sg <- factor(temp_LN_all$sg, levels=levels(temp_LN_all$sg), labels=c("MSM","MSW","Women"))
+  if(int_outtype=='LN'){
+    var_name='late neurosyphilis'
+  } else{
+    var_name='tertiary syphilis'
+  }
+  this_plot <- ggplot(temp_LN_all %>% filter(!age %in% c("0-4","5-9")),aes(x=variable,y=value,group=sg, color=sg))+
+    geom_line(size=1)+
+    facet_wrap(~age)+
+    ylab(paste0("Proportion of primary syphilis\nthat develops ",var_name))+
+    xlab("Year since primary syphilis")+
+    theme_bw()+
+    theme(legend.title=element_blank())
+  return(this_plot)
+}
+plt_LN <- plot_intoutcome('LN')
+ggsave(paste0(myoutdir,"intoutcome_LN.pdf"),width=8,height=6)
+plt_TS <- plot_intoutcome('TS')
+ggsave(paste0(myoutdir,"intoutcome_TS.pdf"),width=8,height=6)
+
+## 5. Proportion of QALYs lost by syphilis stage
+prep_qalyprop <- function(data, type){
+  if (type=='mean'){
+    dt <- data %>%
+      select(contains('mean'))%>%
+      rename(PS = PS_mean,
+             SS = SS_mean,
+             TS_notx = TS_notx_mean,
+             TS = TS_mean,
+             EN = EN_mean,
+             LN = LN_mean,
+             Dead_TS = Dead_TS_mean)
+  }else if(type == 'lb'){
+    dt <- data %>%
+      select(contains('lb'))%>%
+      rename(PS = PS_lb,
+             SS = SS_lb,
+             TS_notx = TS_notx_lb,
+             TS = TS_lb,
+             EN = EN_lb,
+             LN = LN_lb,
+             Dead_TS = Dead_TS_lb)
+  }else{
+    dt <- data %>%
+      select(contains('ub'))%>%
+      rename(PS = PS_ub,
+       SS = SS_ub,
+       TS_notx = TS_notx_ub,
+       TS = TS_ub,
+       EN = EN_ub,
+       LN = LN_ub,
+       Dead_TS = Dead_TS_ub)
+  }
+  
+  dt2 <- dt %>%
+    rowwise() %>%
+    mutate(
+      tot_qaly = PS + SS + TS_notx + TS + EN + LN + Dead_TS
+    ) 
+  prop <- dt2 %>%
+    mutate(
+      PS_prop = PS/tot_qaly*100,
+      SS_prop = SS/tot_qaly*100,
+      TS_notx_prop = TS_notx/tot_qaly*100,
+      TS_prop = TS/tot_qaly*100,
+      EN_prop = EN/tot_qaly*100,
+      LN_prop = LN/tot_qaly*100,
+      Dead_TS_prop = Dead_TS/tot_qaly*100
+    ) %>%
+    select(PS_prop,SS_prop,TS_notx_prop,TS_prop,EN_prop,LN_prop,Dead_TS_prop)
+  
+  prop <- prop[-c(1,2),] # remove the age group "0-4" and "5-9"
+  prop$age=factor(c("10-14","15-19","20-24","25-29","30-34","35-39","40-44","45-54","55-64","65+"), levels=c("10-14","15-19","20-24","25-29","30-34","35-39","40-44","45-54","55-64","65+")) # add age variable
+  
+  return(prop)
+}
+
+plot_qalyprop <- function(data, label){
+  # calculate proportion of qalys lost by syphilis stage
+  prop <- prep_qalyprop(data,'mean')
+  lb <- prep_qalyprop(data,'lb')
+  ub <- prep_qalyprop(data,'ub')
+  
+  prop_t <- melt(prop, id.vars="age")
+  prop_t$variable = factor(prop_t$variable, labels=c('Primary syphilis','Secondary syphilis','Untreated tertiary syphilis', 'Longterm sequelae', 'Early neurosyphilis', 'Late neurosyphilis', 'Excess mortality'))
+  # plot the stacked bar graph
+  this_plot <-ggplot() +
+    geom_bar(data = prop_t, aes(x = age, y = value, fill = variable),position = "stack",stat = "identity", width = 0.6)+
+    xlab("Age at infection (years)")+
+    ylab("Proportion(%) of QALYs lost \n in each stage")+
+    labs(title = "Stage")+
+    ggtitle(label)+
+    scale_y_continuous(expand = c(0,0))+
+    theme(
+      # backgrounds
+      panel.grid.major = element_blank(), panel.grid.minor= element_blank(), panel.background = element_blank(), axis.line=element_line(colour = "black"), legend.key = element_blank(),
+      # title
+      plot.title = element_text(hjust = 0.5, vjust = 1.5, size = 15),
+      legend.title=element_blank(),
+      legend.text=element_text(size = 10),
+      legend.position = 'right',
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text.x = element_text(size = 11, angle = 30, margin = margin(t=10)),
+      axis.text.y = element_text(size = 11),
+      strip.text.x = element_text(size = 11))+
+      scale_fill_brewer(palette="Set1")
+  
+  return(this_plot)
+}
+QALY_prop_MSM <- read.csv(paste0(myoutdir,"PSAsum_QALYprop_MSM.csv"))
+QALY_prop_MSW <- read.csv(paste0(myoutdir,"PSAsum_QALYprop_MSW.csv"))
+QALY_prop_W <- read.csv(paste0(myoutdir,"PSAsum_QALYprop_NoPregW.csv"))
+
+plt_qaly_prop_msm <- plot_qalyprop(QALY_prop_MSM, 'MSM')
+plt_qaly_prop_msw <- plot_qalyprop(QALY_prop_MSW, "MSW")
+plt_qaly_prop_w <- plot_qalyprop(QALY_prop_W, "Women")
+
+ggarrange(plt_qaly_prop_msm,plt_qaly_prop_msw,plt_qaly_prop_w,nrow=2, ncol=2,common.legend = TRUE,legend='right')
+ggsave(paste0(myoutdir,"QALY_prop_mean2.pdf"),width=9,height=6)
+```
